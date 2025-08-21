@@ -94,7 +94,8 @@ class AdvancedFootballPredictor:
             'La Liga': 'PD',
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
-            'Ligue 1': 'FL1'
+            'Ligue 1': 'FL1',
+            'Champions League': 'CL'
         }
         
         # Initialize models
