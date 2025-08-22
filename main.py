@@ -154,6 +154,7 @@ class AdvancedFootballPredictor:
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
             'Ligue 1': 'FL1',
+            'Eredivisie': 'DED',
         }
         
         # Initialize rate limiter with 9 requests per minute to avoid 429 errors
