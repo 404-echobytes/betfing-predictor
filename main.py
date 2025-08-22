@@ -853,15 +853,15 @@ def main():
         # Get recommendations
         print("\nGetting betting recommendations...")
         recommendations = predictor.get_recommendations()
+
+        # Print results
+        predictor.print_recommendations(recommendations)   
         
         #Writing into a txt file
         function_source = inspect.getsource(recommendations)
         with open("tips.txt", "w") as f:
             f.write(function_source)
 
-        # Print results
-        predictor.print_recommendations(recommendations)
-        
         # Show final rate limiter status
         status = predictor.rate_limiter.get_status()
         print(f"\nFinal API usage: {status['requests_used']}/{status['requests_used'] + status['requests_remaining']} requests used")
