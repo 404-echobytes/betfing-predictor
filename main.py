@@ -1,8 +1,4 @@
-"""
-Football Betting Predictor with Rate Limiting
-Self-contained script - no interfaces, just core prediction functionality
-"""
-
+import inspect
 import requests
 import pandas as pd
 import numpy as np
@@ -70,7 +66,7 @@ class BettingRecommendation:
     match_id: str
     home_team: str
     away_team: str
-    outcome: str  # 'H', 'D', 'A', '1X', 'X2', '12'
+    outcome: str  # 'H', 'D', 'A', '1X', 'X2', '12', 'O1.5', 'U1.5', 'O2.5', 'U2.5', 'OC8.5', 'UC8.5'
     predicted_prob: float
     bookmaker_odds: float
     implied_prob: float
@@ -96,6 +92,14 @@ class MatchPrediction:
     double_chance_1x: float = 0.0  # Home win OR Draw
     double_chance_x2: float = 0.0  # Draw OR Away win
     double_chance_12: float = 0.0  # Home win OR Away win
+    # Goals predictions
+    over_15_goals: float = 0.0     # Over 1.5 goals
+    under_15_goals: float = 0.0    # Under 1.5 goals
+    over_25_goals: float = 0.0     # Over 2.5 goals
+    under_25_goals: float = 0.0    # Under 2.5 goals
+    # Corners predictions
+    over_85_corners: float = 0.0   # Over 8.5 corners
+    under_85_corners: float = 0.0  # Under 8.5 corners
 
 class EloRating:
     """Elo rating system for team strength estimation"""
@@ -146,6 +150,7 @@ class AdvancedFootballPredictor:
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
             'Ligue 1': 'FL1',
+            #'Eredivisie': 'DED'
         }
         
         # Initialize rate limiter with 9 requests per minute to avoid 429 errors
@@ -256,6 +261,16 @@ class AdvancedFootballPredictor:
                     double_chance_x2 = np.random.uniform(1.2, 2.0)  # Draw or Away
                     double_chance_12 = np.random.uniform(1.1, 1.6)  # Home or Away
                     
+                    # Goals markets odds
+                    over_15_goals_odds = np.random.uniform(1.1, 1.4)  # Over 1.5 goals
+                    under_15_goals_odds = np.random.uniform(2.5, 4.0)  # Under 1.5 goals
+                    over_25_goals_odds = np.random.uniform(1.4, 2.2)  # Over 2.5 goals
+                    under_25_goals_odds = np.random.uniform(1.6, 2.8)  # Under 2.5 goals
+                    
+                    # Corners markets odds
+                    over_85_corners_odds = np.random.uniform(1.7, 2.3)  # Over 8.5 corners
+                    under_85_corners_odds = np.random.uniform(1.5, 2.1)  # Under 8.5 corners
+                    
                     fixture = {
                         'date': match['utcDate'],
                         'home_team': match['homeTeam']['name'],
@@ -268,7 +283,13 @@ class AdvancedFootballPredictor:
                             'away': away_odds,
                             'double_chance_1x': double_chance_1x,
                             'double_chance_x2': double_chance_x2,
-                            'double_chance_12': double_chance_12
+                            'double_chance_12': double_chance_12,
+                            'over_15_goals': over_15_goals_odds,
+                            'under_15_goals': under_15_goals_odds,
+                            'over_25_goals': over_25_goals_odds,
+                            'under_25_goals': under_25_goals_odds,
+                            'over_85_corners': over_85_corners_odds,
+                            'under_85_corners': under_85_corners_odds
                         }
                     }
                     fixtures.append(fixture)
@@ -400,6 +421,77 @@ class AdvancedFootballPredictor:
             'goals_for_avg': 0.0, 'goals_against_avg': 0.0,
             'recent_form': 0.0, 'recent_goals_for': 0.0, 'recent_goals_against': 0.0,
             'elo_rating': self.elo_system.initial_rating
+        }
+    
+    def predict_goals_markets(self, home_features, away_features):
+        """Predict over/under goals markets based on team features"""
+        # Calculate expected total goals based on team averages
+        home_goals_avg = home_features.get('goals_for_avg', 1.2)
+        away_goals_avg = away_features.get('goals_for_avg', 1.0)
+        home_concede_avg = home_features.get('goals_against_avg', 1.0)
+        away_concede_avg = away_features.get('goals_against_avg', 1.2)
+        
+        # Expected goals = (team's scoring avg + opponent's conceding avg) / 2
+        expected_home_goals = (home_goals_avg + away_concede_avg) / 2
+        expected_away_goals = (away_goals_avg + home_concede_avg) / 2
+        expected_total_goals = expected_home_goals + expected_away_goals
+        
+        # Adjust based on recent form
+        home_recent_goals = home_features.get('recent_goals_for', 1.2)
+        away_recent_goals = away_features.get('recent_goals_for', 1.0)
+        recent_total = home_recent_goals + away_recent_goals
+        
+        # Weighted average (70% season avg, 30% recent form)
+        adjusted_total = 0.7 * expected_total_goals + 0.3 * recent_total
+        
+        # Calculate probabilities using Poisson-like distribution assumptions
+        # Over 1.5 goals (more than 1 goal)
+        over_15_prob = min(0.95, max(0.05, (adjusted_total - 0.8) / 2.5))
+        under_15_prob = 1.0 - over_15_prob
+        
+        # Over 2.5 goals (more than 2 goals)
+        over_25_prob = min(0.90, max(0.05, (adjusted_total - 1.5) / 3.0))
+        under_25_prob = 1.0 - over_25_prob
+        
+        return {
+            'over_15': over_15_prob,
+            'under_15': under_15_prob,
+            'over_25': over_25_prob,
+            'under_25': under_25_prob
+        }
+    
+    def predict_corners_markets(self, home_features, away_features):
+        """Predict over/under corners markets based on team style"""
+        # Base corners expectation (average match has ~10 corners)
+        base_corners = 10.0
+        
+        # Adjust based on team characteristics
+        home_attack_style = home_features.get('goals_for_avg', 1.2) * 2  # Attacking teams get more corners
+        away_attack_style = away_features.get('goals_for_avg', 1.0) * 2
+        
+        # Defensive teams also contribute to corners (through defending)
+        home_defense_factor = home_features.get('goals_against_avg', 1.0) * 1.5
+        away_defense_factor = away_features.get('goals_against_avg', 1.2) * 1.5
+        
+        # Recent form impact
+        home_form = home_features.get('recent_form', 0.5)
+        away_form = away_features.get('recent_form', 0.5)
+        form_factor = (home_form + away_form) * 2
+        
+        # Expected corners calculation
+        expected_corners = base_corners + home_attack_style + away_attack_style + \
+                          (home_defense_factor + away_defense_factor) * 0.3 + form_factor
+        
+        # Cap the expected corners to reasonable range
+        expected_corners = min(16.0, max(6.0, expected_corners))
+        
+        # Over 8.5 corners probability
+        over_85_prob = min(0.85, max(0.15, (expected_corners - 7.0) / 6.0))
+        under_85_prob = 1.0 - over_85_prob
+        
+        return {
+            'over_85': over_85_prob,
+            'under_85': under_85_prob
         }
     
     def prepare_features(self, matches_df):
@@ -577,6 +669,10 @@ class AdvancedFootballPredictor:
         double_chance_x2 = draw_prob + away_prob  # Draw OR Away win
         double_chance_12 = home_prob + away_prob  # Home win OR Away win (no draw)
         
+        # Calculate goals and corners predictions
+        goals_predictions = self.predict_goals_markets(home_features, away_features)
+        corners_predictions = self.predict_corners_markets(home_features, away_features)
+        
         # Determine predicted outcome
         max_prob = max(home_prob, draw_prob, away_prob)
         if max_prob == home_prob:
@@ -600,7 +696,13 @@ class AdvancedFootballPredictor:
             odds={},
             double_chance_1x=double_chance_1x,
             double_chance_x2=double_chance_x2,
-            double_chance_12=double_chance_12
+            double_chance_12=double_chance_12,
+            over_15_goals=goals_predictions['over_15'],
+            under_15_goals=goals_predictions['under_15'],
+            over_25_goals=goals_predictions['over_25'],
+            under_25_goals=goals_predictions['under_25'],
+            over_85_corners=corners_predictions['over_85'],
+            under_85_corners=corners_predictions['under_85']
         )
     
     def calculate_betting_value(self, prediction, odds):
@@ -621,8 +723,22 @@ class AdvancedFootballPredictor:
             ('12', prediction.double_chance_12, odds.get('double_chance_12', 0))
         ]
         
+        # Goals markets outcomes
+        goals_outcomes = [
+            ('O1.5', prediction.over_15_goals, odds.get('over_15_goals', 0)),
+            ('U1.5', prediction.under_15_goals, odds.get('under_15_goals', 0)),
+            ('O2.5', prediction.over_25_goals, odds.get('over_25_goals', 0)),
+            ('U2.5', prediction.under_25_goals, odds.get('under_25_goals', 0))
+        ]
+        
+        # Corners markets outcomes
+        corners_outcomes = [
+            ('OC8.5', prediction.over_85_corners, odds.get('over_85_corners', 0)),
+            ('UC8.5', prediction.under_85_corners, odds.get('under_85_corners', 0))
+        ]
+        
         # Combine all outcomes
-        all_outcomes = outcomes + double_chance_outcomes
+        all_outcomes = outcomes + double_chance_outcomes + goals_outcomes + corners_outcomes
         
         for outcome, prob, bookmaker_odds in all_outcomes:
             if bookmaker_odds <= 1.0:  # Invalid odds
@@ -705,7 +821,13 @@ class AdvancedFootballPredictor:
                 'A': 'Away Win',
                 '1X': 'Home Win or Draw',
                 'X2': 'Draw or Away Win', 
-                '12': 'Home Win or Away Win'
+                '12': 'Home Win or Away Win',
+                'O1.5': 'Over 1.5 Goals',
+                'U1.5': 'Under 1.5 Goals',
+                'O2.5': 'Over 2.5 Goals',
+                'U2.5': 'Under 2.5 Goals',
+                'OC8.5': 'Over 8.5 Corners',
+                'UC8.5': 'Under 8.5 Corners'
             }
             
             print(f"\n{i}. {rec.home_team} vs {rec.away_team}")
@@ -732,6 +854,11 @@ def main():
         print("\nGetting betting recommendations...")
         recommendations = predictor.get_recommendations()
         
+        #Writing into a txt file
+        function_source = inspect.getsource(recommendations)
+        with open("tips.txt", "w") as f:
+            f.write(function_source)
+
         # Print results
         predictor.print_recommendations(recommendations)
         
