@@ -1,30 +1,76 @@
+"""
+Football Betting Predictor with Rate Limiting
+Self-contained script - no interfaces, just core prediction functionality
+"""
 
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import json
 import time
 import warnings
-from typing import Dict, List, Tuple, Optional
+import threading
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
+from sklearn.metrics import accuracy_score
 import xgboost as xgb
-import math
-import yagmail
-import os
+from collections import deque
 
 warnings.filterwarnings('ignore')
+
+class RateLimiter:
+    """Rate limiter to control API calls - 9 requests per minute to avoid 429 errors"""
+    
+    def __init__(self, max_requests_per_minute=9):
+        self.max_requests = max_requests_per_minute
+        self.interval = 60  # 1 minute in seconds
+        self.requests = deque()
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        """Wait if necessary to respect rate limit"""
+        with self.lock:
+            current_time = time.time()
+            
+            # Remove requests older than 1 minute
+            while self.requests and self.requests[0] <= current_time - self.interval:
+                self.requests.popleft()
+            
+            # If we've hit the limit, wait
+            if len(self.requests) >= self.max_requests:
+                wait_time = self.interval - (current_time - self.requests[0])
+                if wait_time > 0:
+                    print(f"Rate limit: Waiting {wait_time:.1f} seconds before next API call...")
+                    time.sleep(wait_time)
+                    # Remove the old request after waiting
+                    self.requests.popleft()
+            
+            # Record this request
+            self.requests.append(current_time)
+    
+    def get_status(self):
+        """Get current rate limiter status"""
+        with self.lock:
+            current_time = time.time()
+            # Remove old requests
+            while self.requests and self.requests[0] <= current_time - self.interval:
+                self.requests.popleft()
+            
+            return {
+                'requests_used': len(self.requests),
+                'requests_remaining': max(0, self.max_requests - len(self.requests)),
+                'next_reset': self.requests[0] + self.interval if self.requests else current_time
+            }
 
 @dataclass
 class BettingRecommendation:
     match_id: str
     home_team: str
     away_team: str
-    outcome: str  # 'H', 'D', 'A'
+    outcome: str  # 'H', 'D', 'A', '1X', 'X2', '12'
     predicted_prob: float
     bookmaker_odds: float
     implied_prob: float
@@ -46,9 +92,14 @@ class MatchPrediction:
     predicted_outcome: str
     confidence_score: float
     odds: dict
+    # Double chance probabilities
+    double_chance_1x: float = 0.0  # Home win OR Draw
+    double_chance_x2: float = 0.0  # Draw OR Away win
+    double_chance_12: float = 0.0  # Home win OR Away win
 
 class EloRating:
     """Elo rating system for team strength estimation"""
+    
     def __init__(self, k_factor=20, initial_rating=1500):
         self.k_factor = k_factor
         self.initial_rating = initial_rating
@@ -95,8 +146,10 @@ class AdvancedFootballPredictor:
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
             'Ligue 1': 'FL1',
-            #'Champions League': 'CL'
         }
+        
+        # Initialize rate limiter with 9 requests per minute to avoid 429 errors
+        self.rate_limiter = RateLimiter(max_requests_per_minute=9)
         
         # Initialize models
         self.model = xgb.XGBClassifier(
@@ -124,12 +177,56 @@ class AdvancedFootballPredictor:
         self.max_bet_fraction = 0.05  # Max 5% of bankroll per bet
         self.min_ev_threshold = 0.05  # Minimum 5% expected value
         
-    def get_fixtures(self, league_code, days_ahead=7):
-        """Get upcoming fixtures with mock odds data"""
-        try:
-            api_key = "c4d999e143b044f5a5d1b3d86fa01962"
-            headers = {"X-Auth-Token": api_key}
+        # API configuration
+        self.api_key = "c4d999e143b044f5a5d1b3d86fa01962"
+        self.headers = {"X-Auth-Token": self.api_key}
+        self.base_url = "https://api.football-data.org/v4"
+        
+        print("Enhanced Football Predictor initialized with rate limiting")
+    
+    def make_api_request(self, url, params=None, timeout=15):
+        """Make API request with rate limiting and better error handling"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Apply rate limiting
+                self.rate_limiter.wait_if_needed()
+                
+                print(f"Making API request (attempt {attempt + 1}/{max_retries})")
+                
+                response = requests.get(url, headers=self.headers, params=params, timeout=timeout)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:  # Rate limit
+                    wait_time = 60 * (attempt + 1)  # Progressive backoff
+                    print(f"Rate limit exceeded. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                elif response.status_code == 403:
+                    print("API access denied. Check your API key and quota.")
+                    return None
+                elif response.status_code == 404:
+                    print("Resource not found.")
+                    return None
+                else:
+                    print(f"API error: {response.status_code}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
             
+            except requests.exceptions.Timeout:
+                print(f"Request timeout on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+            except requests.exceptions.RequestException as e:
+                print(f"Network error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+        
+        return None
+    
+    def get_fixtures(self, league_code, days_ahead=7):
+        """Get upcoming fixtures with rate limiting"""
+        try:
             today = datetime.now()
             start_of_week = today - timedelta(days=today.weekday())
             end_of_week = start_of_week + timedelta(days=6)
@@ -137,24 +234,27 @@ class AdvancedFootballPredictor:
             date_from = start_of_week.strftime('%Y-%m-%d')
             date_to = end_of_week.strftime('%Y-%m-%d')
             
-            url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
+            url = f"{self.base_url}/competitions/{league_code}/matches"
             params = {
                 'dateFrom': date_from,
                 'dateTo': date_to,
                 'status': 'SCHEDULED'
             }
             
-            response = requests.get(url, headers=headers, params=params, timeout=15)
+            data = self.make_api_request(url, params)
             
-            if response.status_code == 200:
-                data = response.json()
+            if data:
                 fixtures = []
-                
                 for match in data.get('matches', []):
                     # Mock odds data (in real implementation, get from odds API)
                     home_odds = np.random.uniform(1.5, 4.0)
                     draw_odds = np.random.uniform(3.0, 4.5)
                     away_odds = np.random.uniform(1.8, 5.0)
+                    
+                    # Calculate double chance odds (typically lower than individual outcomes)
+                    double_chance_1x = np.random.uniform(1.1, 1.8)  # Home or Draw
+                    double_chance_x2 = np.random.uniform(1.2, 2.0)  # Draw or Away
+                    double_chance_12 = np.random.uniform(1.1, 1.6)  # Home or Away
                     
                     fixture = {
                         'date': match['utcDate'],
@@ -165,14 +265,17 @@ class AdvancedFootballPredictor:
                         'odds': {
                             'home': home_odds,
                             'draw': draw_odds,
-                            'away': away_odds
+                            'away': away_odds,
+                            'double_chance_1x': double_chance_1x,
+                            'double_chance_x2': double_chance_x2,
+                            'double_chance_12': double_chance_12
                         }
                     }
                     fixtures.append(fixture)
                 
                 return fixtures
             else:
-                print(f"API Error for {league_code}: {response.status_code}")
+                print(f"Failed to get fixtures for {league_code}")
                 return []
                 
         except Exception as e:
@@ -180,985 +283,466 @@ class AdvancedFootballPredictor:
             return []
     
     def get_historical_data(self, league_code, seasons=['2023', '2024']):
-        """Get comprehensive historical data with improved error handling"""
+        """Get comprehensive historical data with improved error handling and rate limiting"""
         all_matches = []
         
         for season in seasons:
-            max_retries = 3
-            retry_count = 0
+            print(f"Fetching {league_code} season {season}...")
             
-            while retry_count < max_retries:
-                try:
-                    api_key = "c4d999e143b044f5a5d1b3d86fa01962"
-                    headers = {'X-Auth-Token': api_key}
-                    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
-                    params = {
-                        'season': season,
-                        'status': 'FINISHED'
-                    }
-                    
-                    response = requests.get(url, headers=headers, params=params, timeout=15)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        matches = []
+            url = f"{self.base_url}/competitions/{league_code}/matches"
+            params = {
+                'season': season,
+                'status': 'FINISHED'
+            }
+            
+            data = self.make_api_request(url, params)
+            
+            if data:
+                matches = []
+                for match in data.get('matches', []):
+                    if (match.get('score') and 
+                        match['score'].get('fullTime') and 
+                        match['score']['fullTime']['home'] is not None):
                         
-                        for match in data.get('matches', []):
-                            if (match.get('score') and 
-                                match['score'].get('fullTime') and 
-                                match['score']['fullTime']['home'] is not None):
-                                
-                                home_score = match['score']['fullTime']['home']
-                                away_score = match['score']['fullTime']['away']
-                                
-                                if home_score > away_score:
-                                    result = 'H'
-                                elif away_score > home_score:
-                                    result = 'A'
-                                else:
-                                    result = 'D'
-                                
-                                match_data = {
-                                    'home_team': match['homeTeam']['name'],
-                                    'away_team': match['awayTeam']['name'],
-                                    'home_score': home_score,
-                                    'away_score': away_score,
-                                    'result': result,
-                                    'league': league_code,
-                                    'season': season,
-                                    'date': match['utcDate'],
-                                    'matchday': match.get('matchday', 1),
-                                    'match_id': match['id']
-                                }
-                                matches.append(match_data)
+                        home_score = match['score']['fullTime']['home']
+                        away_score = match['score']['fullTime']['away']
                         
-                        all_matches.extend(matches)
-                        print(f"   - Season {season}: {len(matches)} matches")
-                        break  # Success, exit retry loop
+                        if home_score > away_score:
+                            result = 'H'
+                        elif away_score > home_score:
+                            result = 'A'
+                        else:
+                            result = 'D'
                         
-                    elif response.status_code == 429:  # Rate limit
-                        retry_count += 1
-                        wait_time = 2 ** retry_count  # Exponential backoff
-                        print(f"   - Rate limit hit for {season}, waiting {wait_time}s (attempt {retry_count})")
-                        time.sleep(wait_time)
-                    elif response.status_code == 403:  # Forbidden
-                        print(f"   - Access denied for {season} data for {league_code} (likely quota exceeded)")
-                        break  # Don't retry 403 errors
-                    else:
-                        print(f"   - Error fetching {season} data for {league_code}: {response.status_code}")
-                        retry_count += 1
-                        time.sleep(1)
-                        
-                except requests.exceptions.RequestException as e:
-                    retry_count += 1
-                    print(f"   - Network error fetching {season}: {e}")
-                    if retry_count < max_retries:
-                        time.sleep(2)
-                except Exception as e:
-                    print(f"   - Unexpected error fetching {season}: {e}")
-                    break
+                        match_data = {
+                            'home_team': match['homeTeam']['name'],
+                            'away_team': match['awayTeam']['name'],
+                            'home_score': home_score,
+                            'away_score': away_score,
+                            'result': result,
+                            'league': league_code,
+                            'season': season,
+                            'date': match['utcDate'],
+                            'matchday': match.get('matchday', 1),
+                            'match_id': match['id']
+                        }
+                        matches.append(match_data)
+                
+                all_matches.extend(matches)
+                print(f" - Season {season}: {len(matches)} matches")
+            else:
+                print(f" - Failed to fetch {season} data for {league_code}")
         
         return all_matches
     
-    def create_enhanced_features(self, home_team, away_team, match_date=None):
-        """Create comprehensive feature vector for a match"""
+    def calculate_team_features(self, matches_df, team, home=True):
+        """Calculate comprehensive team features"""
+        team_matches = matches_df[
+            (matches_df['home_team'] == team) if home else (matches_df['away_team'] == team)
+        ].sort_values('date').tail(10)  # Last 10 matches
+        
+        if len(team_matches) == 0:
+            return self._get_default_features()
+        
         features = {}
         
-        # Elo ratings
-        home_elo = self.elo_system.get_rating(home_team)
-        away_elo = self.elo_system.get_rating(away_team)
-        features['home_elo'] = home_elo
-        features['away_elo'] = away_elo
-        features['elo_diff'] = home_elo - away_elo
+        # Basic stats
+        features['games_played'] = len(team_matches)
+        features['wins'] = len(team_matches[team_matches['result'] == ('H' if home else 'A')])
+        features['draws'] = len(team_matches[team_matches['result'] == 'D'])
+        features['losses'] = features['games_played'] - features['wins'] - features['draws']
         
-        # Team-specific features
-        home_stats = self.team_features.get(home_team, self._default_team_stats())
-        away_stats = self.team_features.get(away_team, self._default_team_stats())
-        
-        # Recent form (weighted by recency)
-        features['home_form_5'] = home_stats.get('form_5', 1.5)
-        features['away_form_5'] = away_stats.get('form_5', 1.5)
-        features['home_form_10'] = home_stats.get('form_10', 1.5)
-        features['away_form_10'] = away_stats.get('form_10', 1.5)
-        
-        # Home/Away specific performance
-        features['home_win_rate_home'] = home_stats.get('home_win_rate', 0.5)
-        features['away_win_rate_away'] = away_stats.get('away_win_rate', 0.4)
-        features['home_goals_home'] = home_stats.get('home_goals_avg', 1.5)
-        features['away_goals_away'] = away_stats.get('away_goals_avg', 1.2)
-        
-        # Attack vs Defense matchups
-        features['attack_vs_defense'] = home_stats.get('goals_per_game', 1.5) - away_stats.get('goals_against_per_game', 1.5)
-        features['away_attack_vs_home_defense'] = away_stats.get('goals_per_game', 1.5) - home_stats.get('goals_against_per_game', 1.5)
+        # Win rate and form
+        features['win_rate'] = features['wins'] / features['games_played']
+        features['points_per_game'] = (features['wins'] * 3 + features['draws']) / features['games_played']
         
         # Goal statistics
-        features['home_goals_per_game'] = home_stats.get('goals_per_game', 1.5)
-        features['away_goals_per_game'] = away_stats.get('goals_per_game', 1.5)
-        features['home_goals_against'] = home_stats.get('goals_against_per_game', 1.5)
-        features['away_goals_against'] = away_stats.get('goals_against_per_game', 1.5)
-        
-        # Win rates
-        features['home_win_rate'] = home_stats.get('win_rate', 0.5)
-        features['away_win_rate'] = away_stats.get('win_rate', 0.5)
-        features['win_rate_diff'] = features['home_win_rate'] - features['away_win_rate']
-        
-        # Head-to-head if available
-        features['h2h_advantage'] = self._get_h2h_advantage(home_team, away_team)
-        
-        # Home advantage
-        features['home_advantage'] = 1.0
-        
-        # Season timing (early/mid/late season effects)
-        if match_date:
-            try:
-                month = pd.to_datetime(match_date).month
-                features['season_phase'] = self._get_season_phase(month)
-            except:
-                features['season_phase'] = 0.5
+        if home:
+            features['goals_for'] = team_matches['home_score'].sum()
+            features['goals_against'] = team_matches['away_score'].sum()
         else:
-            features['season_phase'] = 0.5
+            features['goals_for'] = team_matches['away_score'].sum()
+            features['goals_against'] = team_matches['home_score'].sum()
+        
+        features['goal_diff'] = features['goals_for'] - features['goals_against']
+        features['goals_for_avg'] = features['goals_for'] / features['games_played']
+        features['goals_against_avg'] = features['goals_against'] / features['games_played']
+        
+        # Recent form (last 5 games)
+        recent_matches = team_matches.tail(5)
+        if len(recent_matches) > 0:
+            recent_wins = len(recent_matches[recent_matches['result'] == ('H' if home else 'A')])
+            features['recent_form'] = recent_wins / len(recent_matches)
+            
+            # Recent goals
+            if home:
+                features['recent_goals_for'] = recent_matches['home_score'].mean()
+                features['recent_goals_against'] = recent_matches['away_score'].mean()
+            else:
+                features['recent_goals_for'] = recent_matches['away_score'].mean()
+                features['recent_goals_against'] = recent_matches['home_score'].mean()
+        else:
+            features['recent_form'] = 0.0
+            features['recent_goals_for'] = 0.0
+            features['recent_goals_against'] = 0.0
+        
+        # Elo rating
+        features['elo_rating'] = self.elo_system.get_rating(team)
         
         return features
     
-    def _default_team_stats(self):
-        """Default team statistics"""
+    def _get_default_features(self):
+        """Return default features for teams with no match history"""
         return {
-            'form_5': 1.5, 'form_10': 1.5,
-            'home_win_rate': 0.5, 'away_win_rate': 0.4,
-            'home_goals_avg': 1.5, 'away_goals_avg': 1.2,
-            'goals_per_game': 1.5, 'goals_against_per_game': 1.5,
-            'win_rate': 0.5
+            'games_played': 0, 'wins': 0, 'draws': 0, 'losses': 0,
+            'win_rate': 0.0, 'points_per_game': 0.0,
+            'goals_for': 0, 'goals_against': 0, 'goal_diff': 0,
+            'goals_for_avg': 0.0, 'goals_against_avg': 0.0,
+            'recent_form': 0.0, 'recent_goals_for': 0.0, 'recent_goals_against': 0.0,
+            'elo_rating': self.elo_system.initial_rating
         }
     
-    def _get_h2h_advantage(self, home_team, away_team):
-        """Calculate head-to-head advantage"""
-        try:
-            h2h_matches = [m for m in self.match_history 
-                          if (m['home_team'] == home_team and m['away_team'] == away_team) or
-                             (m['home_team'] == away_team and m['away_team'] == home_team)]
-            
-            if len(h2h_matches) < 3:
-                return 0.0
-            
-            home_advantage = 0
-            for match in h2h_matches[-5:]:  # Last 5 H2H matches
-                if match['home_team'] == home_team:
-                    if match['result'] == 'H':
-                        home_advantage += 1
-                    elif match['result'] == 'D':
-                        home_advantage += 0.5
-                else:  # Away team in historical match
-                    if match['result'] == 'A':
-                        home_advantage += 1
-                    elif match['result'] == 'D':
-                        home_advantage += 0.5
-            
-            return home_advantage / min(len(h2h_matches), 5) - 0.5
-        except:
-            return 0.0
-    
-    def _get_season_phase(self, month):
-        """Get season phase (0=early, 0.5=mid, 1=late)"""
-        if month in [8, 9, 10]:  # Early season
-            return 0.2
-        elif month in [11, 12, 1, 2]:  # Mid season
-            return 0.5
-        else:  # Late season
-            return 0.8
-    
-    def update_team_features(self, df):
-        """Update comprehensive team features from match data"""
-        self.team_features = {}
+    def prepare_features(self, matches_df):
+        """Prepare features for machine learning"""
+        features = []
+        targets = []
         
-        try:
-            for team in set(list(df['home_team']) + list(df['away_team'])):
-                team_matches = df[(df['home_team'] == team) | (df['away_team'] == team)].copy()
-                team_matches = team_matches.sort_values('date')
-                
-                # Calculate various statistics
-                home_matches = df[df['home_team'] == team]
-                away_matches = df[df['away_team'] == team]
-                
-                # Form calculation with recency weighting
-                recent_5 = self._calculate_weighted_form(team_matches.tail(5), team)
-                recent_10 = self._calculate_weighted_form(team_matches.tail(10), team)
-                
-                # Home/Away specific stats
-                home_wins = len(home_matches[home_matches['result'] == 'H'])
-                home_total = len(home_matches)
-                away_wins = len(away_matches[away_matches['result'] == 'A'])
-                away_total = len(away_matches)
-                
-                self.team_features[team] = {
-                    'form_5': recent_5,
-                    'form_10': recent_10,
-                    'home_win_rate': home_wins / max(home_total, 1),
-                    'away_win_rate': away_wins / max(away_total, 1),
-                    'home_goals_avg': home_matches['home_score'].mean() if home_total > 0 else 1.5,
-                    'away_goals_avg': away_matches['away_score'].mean() if away_total > 0 else 1.2,
-                    'goals_per_game': self._calculate_goals_per_game(team_matches, team),
-                    'goals_against_per_game': self._calculate_goals_against_per_game(team_matches, team),
-                    'win_rate': self._calculate_win_rate(team_matches, team)
-                }
-        except Exception as e:
-            print(f"Error updating team features: {e}")
-    
-    def _calculate_weighted_form(self, matches, team):
-        """Calculate form with exponential decay for recency"""
-        try:
-            if len(matches) == 0:
-                return 1.5
-            
-            points = []
-            weights = []
-            
-            for i, (_, match) in enumerate(matches.iterrows()):
-                weight = 0.8 ** (len(matches) - i - 1)  # More recent = higher weight
-                
-                if match['home_team'] == team:
-                    if match['result'] == 'H':
-                        points.append(3)
-                    elif match['result'] == 'D':
-                        points.append(1)
-                    else:
-                        points.append(0)
-                else:
-                    if match['result'] == 'A':
-                        points.append(3)
-                    elif match['result'] == 'D':
-                        points.append(1)
-                    else:
-                        points.append(0)
-                
-                weights.append(weight)
-            
-            return np.average(points, weights=weights) if points else 1.5
-        except:
-            return 1.5
-    
-    def _calculate_goals_per_game(self, matches, team):
-        """Calculate average goals scored per game"""
-        try:
-            goals = []
-            for _, match in matches.iterrows():
-                if match['home_team'] == team:
-                    goals.append(match['home_score'])
-                else:
-                    goals.append(match['away_score'])
-            return np.mean(goals) if goals else 1.5
-        except:
-            return 1.5
-    
-    def _calculate_goals_against_per_game(self, matches, team):
-        """Calculate average goals conceded per game"""
-        try:
-            goals = []
-            for _, match in matches.iterrows():
-                if match['home_team'] == team:
-                    goals.append(match['away_score'])
-                else:
-                    goals.append(match['home_score'])
-            return np.mean(goals) if goals else 1.5
-        except:
-            return 1.5
-    
-    def _calculate_win_rate(self, matches, team):
-        """Calculate overall win rate"""
-        try:
-            wins = 0
-            for _, match in matches.iterrows():
-                if (match['home_team'] == team and match['result'] == 'H') or \
-                   (match['away_team'] == team and match['result'] == 'A'):
-                    wins += 1
-            return wins / len(matches) if len(matches) > 0 else 0.5
-        except:
-            return 0.5
-    
-    def train_model(self):
-        """Train advanced model with time series validation"""
-        try:
-            print("Fetching comprehensive historical data...")
-            all_matches = []
-            
-            # Skip 2022 to avoid API quota issues
-            seasons = ['2023', '2024']
-            
-            for league_name, league_code in self.leagues.items():
-                print(f"Getting data for {league_name}...")
-                matches = self.get_historical_data(league_code, seasons)
-                all_matches.extend(matches)
-                time.sleep(2)  # Increased delay to avoid rate limits
-            
-            print(f"Total matches fetched: {len(all_matches)}")
-            
-            if len(all_matches) < 100:  # Minimum threshold for training
-                print("Insufficient real data available. Using enhanced sample data...")
-                sample_data = self._generate_sample_data()
-                all_matches.extend(sample_data)
-                print(f"Added {len(sample_data)} sample matches")
-            
-            # Convert to DataFrame and sort by date
-            df = pd.DataFrame(all_matches)
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.sort_values('date').reset_index(drop=True)
-            
-            print(f"Training with {len(df)} matches")
-            
-            self.match_history = all_matches
-            
-            # Update Elo ratings chronologically
-            print("Calculating Elo ratings...")
-            for _, match in df.iterrows():
-                self.elo_system.update_ratings(match['home_team'], match['away_team'], match['result'])
-            
-            # Reset Elo for training (we'll rebuild during training)
-            self.elo_system = EloRating(k_factor=25)
-            
-            # Update team features
-            print("Calculating team features...")
-            self.update_team_features(df)
-            
-            # Prepare features chronologically
-            print("Preparing features...")
-            features = []
-            labels = []
-            match_dates = []
-            
-            min_matches_for_features = min(50, len(df) // 4)  # Adaptive threshold
-            
-            for i, row in df.iterrows():
-                if i > min_matches_for_features:  # Skip first matches to allow for stable features
-                    feature_dict = self.create_enhanced_features(
-                        row['home_team'], 
-                        row['away_team'], 
-                        row['date']
-                    )
-                    
-                    features.append(list(feature_dict.values()))
-                    labels.append(row['result'])
-                    match_dates.append(row['date'])
-                    
-                    # Update Elo after using current ratings
-                    self.elo_system.update_ratings(row['home_team'], row['away_team'], row['result'])
-            
-            if len(features) < 50:
-                raise ValueError(f"Insufficient training data: only {len(features)} samples available")
-            
-            X = np.array(features)
-            y = np.array(labels)
-            
-            print(f"Training with {len(X)} samples and {X.shape[1]} features")
-            
-            # Encode string labels to numeric
-            y_encoded = self.label_encoder.fit_transform(y)
-            
-            # Scale features
-            X_scaled = self.scaler.fit_transform(X)
-            
-            # Time series cross-validation
-            print("Training model with time series validation...")
-            n_splits = min(5, len(X) // 20)  # Adaptive splits based on data size
-            if n_splits < 2:
-                n_splits = 2
-            tscv = TimeSeriesSplit(n_splits=n_splits)
-            
-            cv_scores = []
-            cv_log_losses = []
-            
-            for train_idx, val_idx in tscv.split(X_scaled):
-                X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
-                y_train, y_val = y_encoded[train_idx], y_encoded[val_idx]
-                
-                # Train model
-                self.model.fit(X_train, y_train)
-                
-                # Evaluate
-                val_pred = self.model.predict(X_val)
-                val_prob = self.model.predict_proba(X_val)
-                
-                accuracy = np.mean(val_pred == y_val)
-                
-                # Calculate log loss
-                log_loss_score = log_loss(y_val, val_prob)
-                
-                cv_scores.append(accuracy)
-                cv_log_losses.append(log_loss_score)
-            
-            # Final model training
-            self.model.fit(X_scaled, y_encoded)
-            
-            # Calibrate probabilities
-            print("Calibrating probabilities...")
-            self.calibrator = CalibratedClassifierCV(
-                estimator=self.model,
-                method='isotonic',
-                cv=3
+        for _, match in matches_df.iterrows():
+            # Update Elo ratings
+            self.elo_system.update_ratings(
+                match['home_team'], match['away_team'], match['result']
             )
-            self.calibrator.fit(X_scaled, y_encoded)
             
-            print(f"CV Accuracy: {np.mean(cv_scores):.3f} (±{np.std(cv_scores):.3f})")
-            print(f"CV Log Loss: {np.mean(cv_log_losses):.3f} (±{np.std(cv_log_losses):.3f})")
+            # Calculate features for both teams
+            home_features = self.calculate_team_features(
+                matches_df[matches_df['date'] < match['date']], 
+                match['home_team'], home=True
+            )
+            away_features = self.calculate_team_features(
+                matches_df[matches_df['date'] < match['date']], 
+                match['away_team'], home=False
+            )
             
-            # Feature importance
-            feature_names = list(self.create_enhanced_features('Team A', 'Team B').keys())
-            importance_df = pd.DataFrame({
-                'feature': feature_names,
-                'importance': self.model.feature_importances_
-            }).sort_values('importance', ascending=False)
+            # Combine features
+            combined_features = []
+            for key in home_features.keys():
+                combined_features.extend([
+                    home_features[key],
+                    away_features[key],
+                    home_features[key] - away_features[key]  # Difference
+                ])
             
-            print("\nTop 10 Most Important Features:")
-            for _, row in importance_df.head(10).iterrows():
-                print(f"  {row['feature']}: {row['importance']:.3f}")
-            
-            self.trained = True
-            
-        except Exception as e:
-            print(f"Error in training: {e}")
-            # Use sample data if training fails
-            print("Using sample data for demonstration...")
-            sample_data = self._generate_sample_data()
-            df = pd.DataFrame(sample_data)
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.sort_values('date').reset_index(drop=True)
-            
-            self.match_history = sample_data
-            self.update_team_features(df)
-            
-            # Simple training with sample data
-            features = []
-            labels = []
-            
-            for i, row in df.iterrows():
-                if i > 50:
-                    feature_dict = self.create_enhanced_features(
-                        row['home_team'], 
-                        row['away_team'], 
-                        row['date']
-                    )
-                    features.append(list(feature_dict.values()))
-                    labels.append(row['result'])
-                    self.elo_system.update_ratings(row['home_team'], row['away_team'], row['result'])
-            
-            if len(features) > 50:
-                X = np.array(features)
-                y = np.array(labels)
-                y_encoded = self.label_encoder.fit_transform(y)
-                X_scaled = self.scaler.fit_transform(X)
-                
-                self.model.fit(X_scaled, y_encoded)
-                self.calibrator = CalibratedClassifierCV(estimator=self.model, method='isotonic', cv=3)
-                self.calibrator.fit(X_scaled, y_encoded)
-                
-                self.trained = True
-                print("Training completed with sample data")
+            features.append(combined_features)
+            targets.append(match['result'])
+        
+        return np.array(features), np.array(targets)
     
-    def _generate_sample_data(self):
-        """Generate realistic sample data for demonstration"""
-        sample_teams = {
-            'PL': ['Arsenal', 'Chelsea', 'Liverpool', 'Man City', 'Man United', 'Tottenham', 'Newcastle', 'Brighton'],
-            'PD': ['Barcelona', 'Real Madrid', 'Atletico Madrid', 'Sevilla', 'Valencia', 'Villarreal', 'Real Sociedad', 'Athletic Bilbao'],
-            'BL1': ['Bayern Munich', 'Dortmund', 'RB Leipzig', 'Bayer Leverkusen', 'Wolfsburg', 'Frankfurt', 'Borussia M\'gladbach', 'Union Berlin'],
-            'SA': ['Juventus', 'Inter Milan', 'AC Milan', 'Napoli', 'Roma', 'Lazio', 'Atalanta', 'Fiorentina'],
-            'FL1': ['PSG', 'Marseille', 'Lyon', 'Monaco', 'Nice', 'Lille', 'Rennes', 'Montpellier']
-        }
-        
-        all_matches = []
-        for league, teams in sample_teams.items():
-            # Generate more realistic season structure
-            for i in range(300):  # Balanced sample data
-                home_team = np.random.choice(teams)
-                away_team = np.random.choice([t for t in teams if t != home_team])
-                
-                result = np.random.choice(['H', 'A', 'D'], p=[0.46, 0.27, 0.27])
-                
-                if result == 'H':
-                    home_score = np.random.randint(1, 5)
-                    away_score = np.random.randint(0, home_score)
-                elif result == 'A':
-                    away_score = np.random.randint(1, 4)
-                    home_score = np.random.randint(0, away_score)
-                else:
-                    score = np.random.randint(0, 3)
-                    home_score = away_score = score
-                
-                season = np.random.choice(['2023', '2024'])
-                year = 2023 if season == '2023' else 2024
-                month = np.random.randint(8, 13) if season == '2023' else np.random.randint(1, 6)
-                day = np.random.randint(1, 29)
-                date = f"{year}-{month:02d}-{day:02d}T15:00:00Z"
-                
-                all_matches.append({
-                    'home_team': home_team,
-                    'away_team': away_team,
-                    'home_score': home_score,
-                    'away_score': away_score,
-                    'result': result,
-                    'league': league,
-                    'season': season,
-                    'date': date,
-                    'match_id': f"{league}_{i}"
-                })
-        
-        return all_matches
-    
-    def predict_match_probabilities(self, home_team, away_team):
-        """Predict match outcome probabilities"""
-        try:
-            if not self.trained:
-                return None
-            
-            features_dict = self.create_enhanced_features(home_team, away_team)
-            features = np.array([list(features_dict.values())])
-            features_scaled = self.scaler.transform(features)
-            
-            # Get calibrated probabilities
-            probabilities = self.calibrator.predict_proba(features_scaled)[0]
-            classes = self.calibrator.classes_
-            
-            # Decode classes back to string labels
-            decoded_classes = self.label_encoder.inverse_transform(classes)
-            
-            # Create probability dictionary
-            prob_dict = {}
-            for i, class_label in enumerate(decoded_classes):
-                if class_label == 'H':
-                    prob_dict['Home'] = probabilities[i]
-                elif class_label == 'A':
-                    prob_dict['Away'] = probabilities[i]
-                else:
-                    prob_dict['Draw'] = probabilities[i]
-            
-            return prob_dict
-        except Exception as e:
-            print(f"Error predicting probabilities: {e}")
-            return {'Home': 0.45, 'Draw': 0.27, 'Away': 0.28}  # Default probabilities
-    
-    def calculate_expected_value(self, predicted_prob, bookmaker_odds):
-        """Calculate expected value of a bet"""
-        try:
-            implied_prob = 1 / bookmaker_odds
-            expected_value = (predicted_prob * bookmaker_odds) - 1
-            return expected_value, implied_prob
-        except:
-            return 0.0, 0.5
-    
-    def kelly_criterion(self, predicted_prob, bookmaker_odds, fraction=0.25):
-        """Calculate Kelly Criterion bet size"""
-        try:
-            implied_prob = 1 / bookmaker_odds
-            edge = predicted_prob - implied_prob
-            
-            if edge <= 0:
-                return 0
-            
-            kelly_fraction = edge / (bookmaker_odds - 1)
-            # Use fractional Kelly to reduce risk
-            return min(kelly_fraction * fraction, self.max_bet_fraction)
-        except:
-            return 0
-    
-    def send_email_report(self, all_predictions, recommendations, multiple_bet):
-        """Send email report with predictions and recommendations"""
-        try:
-            email_content = self._format_email_content(all_predictions, recommendations, multiple_bet)
-            
-            print("\n📧 EMAIL REPORT:")
-            print("=" * 80)
-            print(email_content)
-            print("=" * 80)
-            
-            # Try to send actual email (commented out for security)
-            # Note: In production, use environment variables for credentials
-            # yag = yagmail.SMTP(user='your_email@gmail.com', password='app_password')
-            # yag.send(to='moghenerhona@gmail.com', subject='Football Betting Predictions', contents=email_content)
-            
-            print("✅ Email report generated successfully!")
-            
-        except Exception as e:
-            print(f"Error sending email: {e}")
-            print("📧 Email functionality disabled for security. Report printed to console.")
-    
-    def _format_email_content(self, all_predictions, recommendations, multiple_bet):
-        """Format email content with all predictions"""
-        content = []
-        content.append("🚀 FOOTBALL BETTING PREDICTIONS REPORT")
-        content.append("=" * 60)
-        content.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        content.append("")
-        
-        # All matches by league
-        content.append("📊 ALL MATCHES THIS WEEK BY LEAGUE:")
-        content.append("-" * 40)
-        
-        leagues_matches = {}
-        for pred in all_predictions:
-            if pred.league not in leagues_matches:
-                leagues_matches[pred.league] = []
-            leagues_matches[pred.league].append(pred)
-        
-        for league, matches in leagues_matches.items():
-            content.append(f"\n🏆 {league}:")
-            for match in matches:
-                content.append(f"   {match.home_team} vs {match.away_team}")
-                content.append(f"   Prediction: {match.predicted_outcome} ({match.confidence_score:.1%} confidence)")
-                content.append(f"   Probabilities: H:{match.home_prob:.1%} D:{match.draw_prob:.1%} A:{match.away_prob:.1%}")
-                content.append("")
-        
-        # Profitable betting opportunities
-        if recommendations:
-            content.append("💰 PROFITABLE BETTING OPPORTUNITIES:")
-            content.append("-" * 40)
-            for i, rec in enumerate(recommendations[:10], 1):
-                content.append(f"{i}. {rec.home_team} vs {rec.away_team}")
-                content.append(f"   Bet: {rec.outcome} @ {rec.bookmaker_odds:.2f}")
-                content.append(f"   Expected Value: {rec.expected_value:+.1%}")
-                content.append(f"   Recommended Bet: ${rec.bet_amount:.0f}")
-                content.append("")
-        
-        # Multiple bet
-        if multiple_bet:
-            content.append("🎯 15-GAME MULTIPLE BET (Most Confident Predictions):")
-            content.append("-" * 40)
-            total_odds = 1.0
-            for i, bet in enumerate(multiple_bet, 1):
-                content.append(f"{i}. {bet['home_team']} vs {bet['away_team']}")
-                content.append(f"   Pick: {bet['prediction']} (Confidence: {bet['confidence']:.1%})")
-                content.append(f"   Odds: {bet['odds']:.2f}")
-                total_odds *= bet['odds']
-                content.append("")
-            
-            content.append(f"Total Multiple Bet Odds: {total_odds:.2f}")
-            content.append(f"$10 bet returns: ${total_odds * 10:.2f}")
-        
-        return "\n".join(content)
-    
-    def generate_all_predictions(self):
-        """Generate predictions for all upcoming matches"""
-        print("Generating predictions for all matches...")
-        
-        all_fixtures = []
-        for league_name, league_code in self.leagues.items():
-            print(f"Fetching fixtures for {league_name}...")
-            fixtures = self.get_fixtures(league_code)
-            for fixture in fixtures:
-                fixture['league_name'] = league_name
-            all_fixtures.extend(fixtures)
-            time.sleep(2)  # Avoid rate limits
-        
-        if not all_fixtures:
-            print("No real fixtures found. Using sample fixtures for demo...")
-            # Enhanced sample fixtures for demo
-            today = datetime.now()
-            sample_fixtures = []
-            
-            leagues_teams = {
-                'Premier League': ['Arsenal', 'Chelsea', 'Liverpool', 'Man City', 'Man United', 'Tottenham', 'Newcastle', 'Brighton', 'West Ham', 'Aston Villa'],
-                'La Liga': ['Barcelona', 'Real Madrid', 'Atletico Madrid', 'Sevilla', 'Valencia', 'Villarreal', 'Real Sociedad', 'Athletic Bilbao'],
-                'Bundesliga': ['Bayern Munich', 'Dortmund', 'RB Leipzig', 'Bayer Leverkusen', 'Wolfsburg', 'Frankfurt'],
-                'Serie A': ['Juventus', 'Inter Milan', 'AC Milan', 'Napoli', 'Roma', 'Lazio'],
-                'Ligue 1': ['PSG', 'Marseille', 'Lyon', 'Monaco', 'Nice', 'Lille']
-            }
-            
-            match_id = 1
-            for league_name, teams in leagues_teams.items():
-                # Generate 3-4 matches per league for the week
-                for i in range(min(4, len(teams)//2)):
-                    home_team = teams[i*2]
-                    away_team = teams[i*2 + 1] if i*2 + 1 < len(teams) else teams[0]
-                    
-                    home_odds = np.random.uniform(1.5, 4.0)
-                    draw_odds = np.random.uniform(3.0, 4.5)
-                    away_odds = np.random.uniform(1.8, 5.0)
-                    
-                    sample_fixtures.append({
-                        'home_team': home_team,
-                        'away_team': away_team,
-                        'date': (today + timedelta(days=i+1)).strftime('%Y-%m-%dT15:00:00Z'),
-                        'league_name': league_name,
-                        'match_id': f'demo_{match_id}',
-                        'odds': {'home': home_odds, 'draw': draw_odds, 'away': away_odds}
-                    })
-                    match_id += 1
-            
-            all_fixtures = sample_fixtures
-        
-        all_predictions = []
-        
-        for fixture in all_fixtures:
-            try:
-                home_team = fixture['home_team']
-                away_team = fixture['away_team']
-                odds = fixture['odds']
-                
-                # Get predicted probabilities
-                prob_dict = self.predict_match_probabilities(home_team, away_team)
-                
-                if prob_dict:
-                    home_prob = prob_dict.get('Home', 0.33)
-                    draw_prob = prob_dict.get('Draw', 0.33)
-                    away_prob = prob_dict.get('Away', 0.33)
-                    
-                    # Determine predicted outcome
-                    if home_prob > draw_prob and home_prob > away_prob:
-                        predicted_outcome = 'Home Win'
-                        confidence_score = home_prob
-                    elif away_prob > draw_prob and away_prob > home_prob:
-                        predicted_outcome = 'Away Win'
-                        confidence_score = away_prob
-                    else:
-                        predicted_outcome = 'Draw'
-                        confidence_score = draw_prob
-                    
-                    prediction = MatchPrediction(
-                        match_id=fixture['match_id'],
-                        home_team=home_team,
-                        away_team=away_team,
-                        league=fixture['league_name'],
-                        date=fixture['date'],
-                        home_prob=home_prob,
-                        draw_prob=draw_prob,
-                        away_prob=away_prob,
-                        predicted_outcome=predicted_outcome,
-                        confidence_score=confidence_score,
-                        odds=odds
-                    )
-                    
-                    all_predictions.append(prediction)
-            except Exception as e:
-                print(f"Error processing fixture {fixture.get('match_id', 'unknown')}: {e}")
-                continue
-        
-        return all_predictions
-    
-    def create_multiple_bet(self, all_predictions, num_games=15):
-        """Create a multiple bet from most confident predictions"""
-        try:
-            # Sort by confidence score
-            sorted_predictions = sorted(all_predictions, key=lambda x: x.confidence_score, reverse=True)
-            
-            multiple_bet = []
-            for pred in sorted_predictions[:num_games]:
-                # Determine the bet details based on prediction
-                if pred.predicted_outcome == 'Home Win':
-                    bet_odds = pred.odds['home']
-                    bet_prediction = f"{pred.home_team} to Win"
-                elif pred.predicted_outcome == 'Away Win':
-                    bet_odds = pred.odds['away']
-                    bet_prediction = f"{pred.away_team} to Win"
-                else:
-                    bet_odds = pred.odds['draw']
-                    bet_prediction = "Draw"
-                
-                multiple_bet.append({
-                    'home_team': pred.home_team,
-                    'away_team': pred.away_team,
-                    'league': pred.league,
-                    'prediction': bet_prediction,
-                    'confidence': pred.confidence_score,
-                    'odds': bet_odds
-                })
-            
-            return multiple_bet
-        except Exception as e:
-            print(f"Error creating multiple bet: {e}")
-            return []
-    
-    def generate_betting_recommendations(self):
-        """Generate betting recommendations for upcoming matches"""
-        print("Generating betting recommendations...")
-        
-        all_fixtures = []
-        for league_name, league_code in self.leagues.items():
-            fixtures = self.get_fixtures(league_code)
-            for fixture in fixtures:
-                fixture['league_name'] = league_name
-            all_fixtures.extend(fixtures)
-            time.sleep(2)
-        
-        if not all_fixtures:
-            # Sample fixtures for demo
-            today = datetime.now()
-            sample_fixtures = [
-                {
-                    'home_team': 'Arsenal', 'away_team': 'Chelsea',
-                    'date': (today + timedelta(days=1)).strftime('%Y-%m-%dT15:00:00Z'),
-                    'league_name': 'Premier League',
-                    'match_id': 'demo_1',
-                    'odds': {'home': 2.1, 'draw': 3.4, 'away': 3.8}
-                },
-                {
-                    'home_team': 'Barcelona', 'away_team': 'Real Madrid',
-                    'date': (today + timedelta(days=2)).strftime('%Y-%m-%dT20:00:00Z'),
-                    'league_name': 'La Liga',
-                    'match_id': 'demo_2',
-                    'odds': {'home': 2.3, 'draw': 3.2, 'away': 3.1}
-                }
-            ]
-            all_fixtures = sample_fixtures
-        
-        recommendations = []
-        
-        for fixture in all_fixtures:
-            try:
-                home_team = fixture['home_team']
-                away_team = fixture['away_team']
-                odds = fixture['odds']
-                
-                # Get predicted probabilities
-                prob_dict = self.predict_match_probabilities(home_team, away_team)
-                
-                if prob_dict:
-                    # Check each outcome for betting opportunities
-                    outcomes = [
-                        ('Home', prob_dict.get('Home', 0), odds['home'], 'H'),
-                        ('Draw', prob_dict.get('Draw', 0), odds['draw'], 'D'),
-                        ('Away', prob_dict.get('Away', 0), odds['away'], 'A')
-                    ]
-                    
-                    for outcome_name, pred_prob, bookmaker_odds, outcome_code in outcomes:
-                        ev, implied_prob = self.calculate_expected_value(pred_prob, bookmaker_odds)
-                        
-                        if ev > self.min_ev_threshold:  # Only positive EV bets
-                            kelly_frac = self.kelly_criterion(pred_prob, bookmaker_odds)
-                            bet_amount = self.bankroll * kelly_frac
-                            
-                            if bet_amount > 10:  # Minimum bet threshold
-                                confidence = "High" if ev > 0.15 else "Medium" if ev > 0.08 else "Low"
-                                
-                                recommendations.append(BettingRecommendation(
-                                    match_id=fixture['match_id'],
-                                    home_team=home_team,
-                                    away_team=away_team,
-                                    outcome=outcome_name,
-                                    predicted_prob=pred_prob,
-                                    bookmaker_odds=bookmaker_odds,
-                                    implied_prob=implied_prob,
-                                    expected_value=ev,
-                                    kelly_fraction=kelly_frac,
-                                    bet_amount=bet_amount,
-                                    confidence=confidence
-                                ))
-            except Exception as e:
-                print(f"Error processing recommendation for {fixture.get('match_id', 'unknown')}: {e}")
-                continue
-        
-        # Sort by expected value
-        recommendations.sort(key=lambda x: x.expected_value, reverse=True)
-        
-        return recommendations
-
-def main():
-    print("🚀 Advanced Football Betting Predictor")
-    print("=" * 60)
-    
-    try:
-        predictor = AdvancedFootballPredictor()
-        
-        # Train the model
-        print("\n📊 Training advanced prediction model...")
-        predictor.train_model()
-        
-        if not predictor.trained:
-            print("❌ Model training failed. Exiting...")
+    def train_model(self, force_retrain=False):
+        """Train the prediction model with all available data"""
+        if self.trained and not force_retrain:
+            print("Model already trained. Use force_retrain=True to retrain.")
             return
         
-        # Generate predictions for all matches
-        print("\n📋 Generating predictions for all matches this week...")
-        all_predictions = predictor.generate_all_predictions()
+        print("Starting model training...")
+        all_matches = []
         
-        # Display all matches by league
-        print(f"\n🏆 ALL MATCHES THIS WEEK ({len(all_predictions)} total):")
-        print("=" * 80)
+        # Show rate limiter status
+        status = self.rate_limiter.get_status()
+        print(f"Rate limiter status: {status['requests_used']}/{status['requests_used'] + status['requests_remaining']} requests used")
         
-        leagues_matches = {}
-        for pred in all_predictions:
-            if pred.league not in leagues_matches:
-                leagues_matches[pred.league] = []
-            leagues_matches[pred.league].append(pred)
+        # Collect data from all leagues
+        for league_name, league_code in self.leagues.items():
+            print(f"\nFetching data for {league_name}...")
+            matches = self.get_historical_data(league_code)
+            all_matches.extend(matches)
+            print(f"Total matches collected so far: {len(all_matches)}")
         
-        for league, matches in leagues_matches.items():
-            print(f"\n🏆 {league} ({len(matches)} matches):")
-            print("-" * 50)
-            for match in matches:
-                print(f"   {match.home_team} vs {match.away_team}")
-                print(f"   📅 {match.date}")
-                print(f"   🎯 Prediction: {match.predicted_outcome} ({match.confidence_score:.1%} confidence)")
-                print(f"   📊 Probabilities: H:{match.home_prob:.1%} D:{match.draw_prob:.1%} A:{match.away_prob:.1%}")
-                print(f"   💰 Odds: H:{match.odds['home']:.2f} D:{match.odds['draw']:.2f} A:{match.odds['away']:.2f}")
-                print()
+        if not all_matches:
+            print("No matches found. Cannot train model.")
+            return
         
-        # Generate betting recommendations
-        print("\n💰 Generating betting recommendations...")
-        recommendations = predictor.generate_betting_recommendations()
+        # Convert to DataFrame and sort by date
+        df = pd.DataFrame(all_matches)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
         
-        if recommendations:
-            print(f"\n🎯 Found {len(recommendations)} profitable betting opportunities:")
-            print("=" * 80)
+        print(f"\nPreparing features from {len(df)} matches...")
+        
+        # Prepare features
+        X, y = self.prepare_features(df)
+        
+        if len(X) == 0:
+            print("No features prepared. Cannot train model.")
+            return
+        
+        print(f"Training on {len(X)} samples with {X.shape[1]} features...")
+        
+        # Encode labels
+        y_encoded = self.label_encoder.fit_transform(y)
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Time series split for validation
+        tscv = TimeSeriesSplit(n_splits=3)
+        
+        # Train model
+        self.model.fit(X_scaled, y_encoded)
+        
+        # Calibrate probabilities
+        self.calibrator = CalibratedClassifierCV(self.model, method='isotonic', cv=3)
+        self.calibrator.fit(X_scaled, y_encoded)
+        
+        # Calculate performance metrics
+        scores = []
+        for train_idx, val_idx in tscv.split(X_scaled):
+            if X_scaled is not None and y_encoded is not None:
+                X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+                y_train, y_val = y_encoded[train_idx], y_encoded[val_idx]
+            else:
+                continue
             
-            total_ev = 0
-            total_bet = 0
+            temp_model = xgb.XGBClassifier(**self.model.get_params())
+            temp_model.fit(X_train, y_train)
             
-            for i, rec in enumerate(recommendations[:10], 1):  # Show top 10
-                print(f"\n{i}. {rec.home_team} vs {rec.away_team}")
-                print(f"   Bet: {rec.outcome} @ {rec.bookmaker_odds:.2f}")
-                print(f"   Model Probability: {rec.predicted_prob:.1%}")
-                print(f"   Implied Probability: {rec.implied_prob:.1%}")
-                print(f"   Expected Value: {rec.expected_value:+.1%}")
-                print(f"   Recommended Bet: ${rec.bet_amount:.0f}")
-                print(f"   Confidence: {rec.confidence}")
-                
-                total_ev += rec.expected_value * rec.bet_amount
-                total_bet += rec.bet_amount
+            y_pred = temp_model.predict(X_val)
+            scores.append(accuracy_score(y_val, y_pred))
+        
+        print(f"Cross-validation accuracy: {np.mean(scores):.3f} ± {np.std(scores):.3f}")
+        
+        self.trained = True
+        self.match_history = all_matches
+        print("Model training completed!")
+    
+    def predict_match(self, home_team, away_team, league):
+        """Predict match outcome"""
+        if not self.trained:
+            print("Model not trained. Please train the model first.")
+            return None
+        
+        # Get recent team performance
+        df = pd.DataFrame(self.match_history)
+        df['date'] = pd.to_datetime(df['date'])
+        
+        home_features = self.calculate_team_features(df, home_team, home=True)
+        away_features = self.calculate_team_features(df, away_team, home=False)
+        
+        # Combine features
+        combined_features = []
+        for key in home_features.keys():
+            combined_features.extend([
+                home_features[key],
+                away_features[key],
+                home_features[key] - away_features[key]
+            ])
+        
+        # Scale and predict
+        X = np.array(combined_features).reshape(1, -1)
+        X_scaled = self.scaler.transform(X)
+        
+        # Get probabilities
+        try:
+            if self.calibrator:
+                probs = self.calibrator.predict_proba(X_scaled)[0]
+            else:
+                probs = self.model.predict_proba(X_scaled)[0]
+        except:
+            # Default probabilities if prediction fails
+            probs = [0.4, 0.3, 0.3]
+        
+        # Map probabilities to outcomes
+        outcomes = self.label_encoder.classes_
+        if outcomes is not None and probs is not None:
+            prob_dict = dict(zip(outcomes, probs))
             
-            print(f"\n📈 Portfolio Summary:")
-            print(f"   Total Bet Amount: ${total_bet:.0f}")
-            print(f"   Expected Profit: ${total_ev:.0f}")
-            print(f"   Portfolio EV: {total_ev/total_bet:.1%}" if total_bet > 0 else "")
+            # Ensure all outcomes are present
+            home_prob = prob_dict.get('H', 0.0)
+            draw_prob = prob_dict.get('D', 0.0)
+            away_prob = prob_dict.get('A', 0.0)
         else:
-            print("No profitable betting opportunities found.")
+            # Default probabilities if prediction fails
+            home_prob = 0.4
+            draw_prob = 0.3
+            away_prob = 0.3
         
-        # Create 15-game multiple bet
-        print("\n🎲 Creating 15-Game Multiple Bet...")
-        multiple_bet = predictor.create_multiple_bet(all_predictions, 15)
+        # Normalize probabilities
+        total_prob = home_prob + draw_prob + away_prob
+        if total_prob > 0:
+            home_prob /= total_prob
+            draw_prob /= total_prob
+            away_prob /= total_prob
         
-        if multiple_bet:
-            print("=" * 80)
-            print("🎯 15-GAME MULTIPLE BET (Most Confident Predictions):")
-            print("-" * 50)
+        # Calculate double chance probabilities
+        double_chance_1x = home_prob + draw_prob  # Home win OR Draw
+        double_chance_x2 = draw_prob + away_prob  # Draw OR Away win
+        double_chance_12 = home_prob + away_prob  # Home win OR Away win (no draw)
+        
+        # Determine predicted outcome
+        max_prob = max(home_prob, draw_prob, away_prob)
+        if max_prob == home_prob:
+            predicted = 'H'
+        elif max_prob == away_prob:
+            predicted = 'A'
+        else:
+            predicted = 'D'
+        
+        return MatchPrediction(
+            match_id=f"{home_team}_vs_{away_team}",
+            home_team=home_team,
+            away_team=away_team,
+            league=league,
+            date=datetime.now().strftime('%Y-%m-%d'),
+            home_prob=home_prob,
+            draw_prob=draw_prob,
+            away_prob=away_prob,
+            predicted_outcome=predicted,
+            confidence_score=max_prob,
+            odds={},
+            double_chance_1x=double_chance_1x,
+            double_chance_x2=double_chance_x2,
+            double_chance_12=double_chance_12
+        )
+    
+    def calculate_betting_value(self, prediction, odds):
+        """Calculate betting value and recommendations"""
+        recommendations = []
+        
+        # Regular outcomes
+        outcomes = [
+            ('H', prediction.home_prob, odds.get('home', 0)),
+            ('D', prediction.draw_prob, odds.get('draw', 0)),
+            ('A', prediction.away_prob, odds.get('away', 0))
+        ]
+        
+        # Double chance outcomes
+        double_chance_outcomes = [
+            ('1X', prediction.double_chance_1x, odds.get('double_chance_1x', 0)),
+            ('X2', prediction.double_chance_x2, odds.get('double_chance_x2', 0)),
+            ('12', prediction.double_chance_12, odds.get('double_chance_12', 0))
+        ]
+        
+        # Combine all outcomes
+        all_outcomes = outcomes + double_chance_outcomes
+        
+        for outcome, prob, bookmaker_odds in all_outcomes:
+            if bookmaker_odds <= 1.0:  # Invalid odds
+                continue
             
-            total_odds = 1.0
-            for i, bet in enumerate(multiple_bet, 1):
-                print(f"{i:2d}. {bet['home_team']} vs {bet['away_team']} ({bet['league']})")
-                print(f"     Pick: {bet['prediction']} @ {bet['odds']:.2f} (Confidence: {bet['confidence']:.1%})")
-                total_odds *= bet['odds']
+            implied_prob = 1 / bookmaker_odds
+            expected_value = (prob * bookmaker_odds) - 1
             
-            print(f"\n🚀 MULTIPLE BET SUMMARY:")
-            print(f"   Total Odds: {total_odds:,.2f}")
-            print(f"   $10 stake returns: ${total_odds * 10:,.2f}")
-            print(f"   $1 stake returns: ${total_odds:,.2f}")
+            if expected_value > self.min_ev_threshold:
+                # Kelly criterion for bet sizing
+                kelly_fraction = (prob * bookmaker_odds - 1) / (bookmaker_odds - 1)
+                kelly_fraction = max(0, min(kelly_fraction, self.max_bet_fraction))
+                
+                bet_amount = self.bankroll * kelly_fraction
+                
+                confidence = "High" if expected_value > 0.15 else "Medium" if expected_value > 0.10 else "Low"
+                
+                recommendation = BettingRecommendation(
+                    match_id=prediction.match_id,
+                    home_team=prediction.home_team,
+                    away_team=prediction.away_team,
+                    outcome=outcome,
+                    predicted_prob=prob,
+                    bookmaker_odds=bookmaker_odds,
+                    implied_prob=implied_prob,
+                    expected_value=expected_value,
+                    kelly_fraction=kelly_fraction,
+                    bet_amount=bet_amount,
+                    confidence=confidence
+                )
+                recommendations.append(recommendation)
         
-        # Send email report
-        print("\n📧 Generating email report...")
-        predictor.send_email_report(all_predictions, recommendations, multiple_bet)
+        return recommendations
+    
+    def get_recommendations(self, league_codes=None):
+        """Get betting recommendations for upcoming matches"""
+        if not self.trained:
+            print("Model not trained. Training now...")
+            self.train_model()
         
-        print("\n🎯 Model Features:")
-        print("   ✅ Elo rating system with dynamic updates")
-        print("   ✅ Advanced feature engineering (23 features)")
-        print("   ✅ XGBoost with time series cross-validation")
-        print("   ✅ Probability calibration")
-        print("   ✅ Expected Value calculation")
-        print("   ✅ Kelly Criterion position sizing")
-        print("   ✅ Risk management (max 5% per bet)")
-        print("   ✅ Complete match analysis for all leagues")
-        print("   ✅ 15-game multiple bet recommendations")
-        print("   ✅ Email reporting system")
+        if league_codes is None:
+            league_codes = list(self.leagues.values())
         
-        print("\n✅ All predictions completed successfully!")
+        all_recommendations = []
         
+        for league_code in league_codes:
+            print(f"\nAnalyzing {league_code} fixtures...")
+            fixtures = self.get_fixtures(league_code)
+            
+            for fixture in fixtures:
+                prediction = self.predict_match(
+                    fixture['home_team'],
+                    fixture['away_team'],
+                    fixture['league']
+                )
+                
+                if prediction:
+                    recommendations = self.calculate_betting_value(prediction, fixture['odds'])
+                    all_recommendations.extend(recommendations)
+        
+        # Sort by expected value
+        all_recommendations.sort(key=lambda x: x.expected_value, reverse=True)
+        
+        return all_recommendations
+    
+    def print_recommendations(self, recommendations):
+        """Print betting recommendations in a readable format"""
+        if not recommendations:
+            print("No betting opportunities found.")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"BETTING RECOMMENDATIONS ({len(recommendations)} opportunities)")
+        print(f"{'='*80}")
+        
+        for i, rec in enumerate(recommendations, 1):
+            outcome_map = {
+                'H': 'Home Win', 
+                'D': 'Draw', 
+                'A': 'Away Win',
+                '1X': 'Home Win or Draw',
+                'X2': 'Draw or Away Win', 
+                '12': 'Home Win or Away Win'
+            }
+            
+            print(f"\n{i}. {rec.home_team} vs {rec.away_team}")
+            print(f"   Bet: {outcome_map[rec.outcome]}")
+            print(f"   Odds: {rec.bookmaker_odds:.2f}")
+            print(f"   Predicted Probability: {rec.predicted_prob:.1%}")
+            print(f"   Expected Value: {rec.expected_value:.1%}")
+            print(f"   Recommended Bet: ${rec.bet_amount:.2f}")
+            print(f"   Confidence: {rec.confidence}")
+
+def main():
+    """Main execution function"""
+    predictor = AdvancedFootballPredictor()
+    
+    print("Starting Football Betting Predictor...")
+    print("API calls are rate-limited to 9 per minute to avoid 429 timeout errors.")
+    
+    try:
+        # Train the model
+        print("\nTraining model with historical data...")
+        predictor.train_model()
+        
+        # Get recommendations
+        print("\nGetting betting recommendations...")
+        recommendations = predictor.get_recommendations()
+        
+        # Print results
+        predictor.print_recommendations(recommendations)
+        
+        # Show final rate limiter status
+        status = predictor.rate_limiter.get_status()
+        print(f"\nFinal API usage: {status['requests_used']}/{status['requests_used'] + status['requests_remaining']} requests used")
+        
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user.")
     except Exception as e:
-        print(f"❌ Critical error in main execution: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main()
