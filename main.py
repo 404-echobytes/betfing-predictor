@@ -1,4 +1,8 @@
-import inspect
+"""
+Football Betting Predictor with Rate Limiting
+Self-contained script - no interfaces, just core prediction functionality
+"""
+
 import requests
 import pandas as pd
 import numpy as np
@@ -150,7 +154,6 @@ class AdvancedFootballPredictor:
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
             'Ligue 1': 'FL1',
-            #'Eredivisie': 'DED'
         }
         
         # Initialize rate limiter with 9 requests per minute to avoid 429 errors
@@ -804,6 +807,47 @@ class AdvancedFootballPredictor:
         
         return all_recommendations
     
+    def save_recommendations_to_file(self, recommendations, filename="tips.txt"):
+        """Save betting recommendations to a text file"""
+        if not recommendations:
+            print("No betting opportunities found.")
+            with open(filename, 'w') as f:
+                f.write("No betting opportunities found.\n")
+            return
+        
+        outcome_map = {
+            'H': 'Home Win', 
+            'D': 'Draw', 
+            'A': 'Away Win',
+            '1X': 'Home Win or Draw',
+            'X2': 'Draw or Away Win', 
+            '12': 'Home Win or Away Win',
+            'O1.5': 'Over 1.5 Goals',
+            'U1.5': 'Under 1.5 Goals',
+            'O2.5': 'Over 2.5 Goals',
+            'U2.5': 'Under 2.5 Goals',
+            'OC8.5': 'Over 8.5 Corners',
+            'UC8.5': 'Under 8.5 Corners'
+        }
+        
+        with open(filename, 'w') as f:
+            f.write(f"{'='*80}\n")
+            f.write(f"BETTING PREDICTIONS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"TOTAL OPPORTUNITIES: {len(recommendations)}\n")
+            f.write(f"{'='*80}\n\n")
+            
+            for i, rec in enumerate(recommendations, 1):
+                f.write(f"{i}. {rec.home_team} vs {rec.away_team}\n")
+                f.write(f"   Bet: {outcome_map[rec.outcome]}\n")
+                f.write(f"   Odds: {rec.bookmaker_odds:.2f}\n")
+                f.write(f"   Predicted Probability: {rec.predicted_prob:.1%}\n")
+                f.write(f"   Expected Value: {rec.expected_value:.1%}\n")
+                f.write(f"   Recommended Bet: ${rec.bet_amount:.2f}\n")
+                f.write(f"   Confidence: {rec.confidence}\n\n")
+        
+        print(f"Betting tips saved to {filename}")
+        print(f"Total recommendations: {len(recommendations)}")
+    
     def print_recommendations(self, recommendations):
         """Print betting recommendations in a readable format"""
         if not recommendations:
@@ -853,15 +897,11 @@ def main():
         # Get recommendations
         print("\nGetting betting recommendations...")
         recommendations = predictor.get_recommendations()
-
-        # Print results
-        predictor.print_recommendations(recommendations)   
         
-        #Writing into a txt file
-        function_source = inspect.getsource(recommendations)
-        with open("tips.txt", "w") as f:
-            f.write(function_source)
-
+        # Save results to file and print summary
+        predictor.save_recommendations_to_file(recommendations, "tips.txt")
+        predictor.print_recommendations(recommendations)
+        
         # Show final rate limiter status
         status = predictor.rate_limiter.get_status()
         print(f"\nFinal API usage: {status['requests_used']}/{status['requests_used'] + status['requests_remaining']} requests used")
