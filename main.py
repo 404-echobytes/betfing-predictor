@@ -14,7 +14,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
 import xgboost as xgb
 import math
-#import yagmail
+import yagmail
 import os
 
 warnings.filterwarnings('ignore')
@@ -95,7 +95,7 @@ class AdvancedFootballPredictor:
             'Bundesliga': 'BL1',
             'Serie A': 'SA',
             'Ligue 1': 'FL1',
-            'Champions League': 'CL'
+            #'Champions League': 'CL'
         }
         
         # Initialize models

@@ -1,0 +1,11 @@
+jax
+matplotlib
+numpy
+pandas
+requests
+scikit-learn
+beautifulsoup4
+lxml
+lightgbm
+xgboost
+yagmail
